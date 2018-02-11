@@ -1,0 +1,152 @@
+---
+title: "Photovoltaics data analysis"
+author: "Kamil Węglarz"
+date: "February 11, 2018"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r installPackages, message=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+install.package.with.check <- function(packageName) {
+  if(packageName %in% rownames(installed.packages()) == FALSE) {
+    install.packages(packageName, dependencies = TRUE, quiet = TRUE)
+  } 
+}
+install.package.with.check("dplyr")
+install.package.with.check("ggplot2")
+install.package.with.check("reshape2")
+install.package.with.check("caret")
+install.package.with.check("arm")
+```
+```{r useLibraries, message=FALSE, results='hide'}
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(caret)
+```
+
+```{r funcions, echo=FALSE}
+norm <- function(x) { (x- min(x))/(max(x)-min(x)) }
+```
+
+## Data analysis
+
+This analysis was performed over photovoltaics data that was gathered from three neighboring solar plants in Italy.
+The data comes from sensors placed next to the photovoltaic panels. Each row in the dataset contains average information from one hour of measurements of a single solar panel. With weather and geographical information, the goal was to find the attributes that best predict the energy produced by a given unit.
+Most relevant attributes were found to be irradiation (mostly), humidity, distance from the sun and altitude. Some of these attributes are highly correlated to others (such as day to distance from the sun). 
+
+```{r setSeed}
+set.seed(1337)
+```
+
+## Load data
+
+Loading data from "data.csv" file:
+```{r loadAndShowData}
+data_raw <- read.csv("data.csv", stringsAsFactors = FALSE)
+df_raw <- tbl_df(data_raw)
+df_raw
+```
+
+## Data recognition
+
+Mostly, values are normalized, but some of them probably were ommited when data was cleaned (before we put out hands on it).
+
+```{r summarize}
+summary(df_raw)
+```
+
+### Codebook
+Attributes:
+* id -> integer -> measurement identifier
+* idsito -> double -> site id
+* idmodel -> double -> panel model id 
+* lat -> double -> latitude
+* lon -> double -> longitude
+* ageinmonths -> double -> device age
+* anno -> integer -> year
+* day -> double -> day of month (normalized like other values)
+* ora -> double -> hour (only 19 uniqe values present)
+* data -> character -> date
+* temperatura_ambiente -> double -> ambient temperature
+* irradiamento -> double -> irradiation
+* pressure -> double -> pressure
+* windspeed -> double -> wind speed
+* humidity dbl humidity NORM 0.16-1
+* icon -> double -> maybe normalized icon identifier
+* dewpoint -> double -> dew point
+* windbearing -> double -> wind bearing (maybe wind direction)
+* cloudcover -> double -> sky cloud coverage
+... few attributes with "i" suffix
+* dist -> double -> distance from sun
+* altitude -> double -> altitude
+* azimuth -> double -> azimuth
+... altitudei and azimuthi -> double -> dbl -> double -> same values as altitude and azimuth but renormalized
+* pcnm1..pcnm15 -> double -> unknown attribute
+* irr_pvgis_mod -> double -> irradiation data from PVGIS source
+* irri_pvgis_mod -> double -> nearly the same as irr_pvgis_mod
+* kwh -> double -> output power
+
+## Clean data
+
+At first incomplete rows are filtered out. Then id-like, meta-data and unrecognized columns are ommited. Finally columns are renamed.
+
+```{r removeNAsAndClean}
+df_cleaner <- df_raw %>% na.omit %>%
+  select(-(idsito:idbrand), -icon, -(tempi:cloudcoveri), -(altitudei:pcnm15), -irri_pvgis_mod) %>% 
+  rename(latitude = lat, longitude = lon, device_age = ageinmonths, year = anno, hour = ora, date = data, ambient_temperature = temperatura_ambiente, irradiation = irradiamento, wind_speed = windspeed, dew_point = dewpoint, wind_bearing = windbearing, cloud_coverage = cloudcover, distance = dist, irradiation_pvgis_modifier = irr_pvgis_mod, output_power = kwh) %>% 
+  print
+```
+
+## Renormalize data where needed
+
+Most values contain normalized values, mostly there's no need to renormalizing them (also frequently renormalization is simply impossible - like device_age - there is no way to find out extreme values).
+
+```{r bringBackNormalized}
+df_clean <- df_cleaner %>% mutate(day = as.integer(day * 365), hour = as.integer(hour * 24), ambient_temperature = norm(ambient_temperature), irradiation = norm(irradiation), pressure = norm(pressure), wind_speed = norm(wind_speed), humidity = norm(humidity), dew_point = norm(dew_point), wind_bearing = norm(wind_bearing)) %>% print 
+```
+
+## Exploring correlation
+
+Now we are building heatmap, but only correlation to output_power is important for us.
+
+```{r correlation}
+df_relevant <- df_clean %>% select(-id, -date)
+cormat <- round(cor(df_relevant),2)
+melted_cormat <- melt(tail(cormat,1), value.name = "correlation")
+corr_to_power <- melted_cormat %>% select(-Var1) %>% rename(variable = Var2) %>% filter(variable != "output_power", abs(correlation) > 0.15) %>% arrange(desc(correlation))
+
+ggplot(corr_to_power, aes(x = variable, y = correlation)) + geom_bar(stat = "identity")
+```
+
+```{r heatmap}
+melted_cormat_unpurged <- melt(cormat, value.name = "correlation")
+ggplot(data = melted_cormat_unpurged, aes(x=Var1, y=Var2, fill=correlation)) + geom_tile() + theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1))
+```
+
+## Building model
+
+Regression models does not need data splitting for training, validation and testing so fitting is straightforward.
+First we try to fit using linear regresion, then we are using Bayesian Generalized Linear Model. Both models claim the same coefficients relevance and both produce nearly the same RMSE. Coeficients suggest that irradiation is much more impactive then other attributes.
+
+```{r fitting_lm}
+fit_lm <- train(output_power ~ ambient_temperature + irradiation + humidity + distance + altitude + azimuth + day + hour, data = df_relevant, method = "lm")
+fit_lm
+```
+
+```{r summary_lm}
+summary(fit_lm)
+```
+
+```{r fitting_bayesglm}
+fit_bayesglm <- train(output_power ~ ambient_temperature + irradiation + humidity + distance + altitude + azimuth + day + hour, data = df_relevant, method = "bayesglm")
+fit_bayesglm
+```
+```{r summary_bayesglm}
+summary(fit_bayesglm)
+```
